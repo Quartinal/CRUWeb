@@ -6,31 +6,67 @@ import {
   BrowserCompatibility,
 } from '../utils/usb-utils'
 import { verifyImage } from '../utils/verification'
+import type { DeviceInfo } from '../types'
 
 export const RecoveryUtility: Component = () => {
   const [writer, setWriter] = createSignal<USBWriter | null>(null)
   const [fileSystemHandle, setFileSystemHandle] =
     createSignal<FileSystemDirectoryHandle | null>(null)
-  const [deviceType, setDeviceType] = createSignal<'usb' | 'mass-storage'>(
-    'usb',
-  )
-  const [_, setDeviceInfo] = createSignal<{
-    name: string
-    totalSpace: number
-    freeSpace: number
-  } | null>(null)
+  const [deviceType, setDeviceType] = createSignal<
+    'usb' | 'mass-storage' | null
+  >(localStorage.getItem('deviceType') as 'usb' | 'mass-storage' | null)
   const [browserType] = createSignal(BrowserCompatibility.detectBrowser())
   const [browserSupportError, setBrowserSupportError] = createSignal<
     string | null
   >(null)
+  const [isMassStorageConsented, setIsMassStorageConsented] = createSignal(
+    localStorage.getItem('massStorageConsent') === 'true',
+  )
 
-  // New signal for mass storage consent checkbox
-  const [isMassStorageConsented, setIsMassStorageConsented] =
-    createSignal(false)
+  // New signal for model filter input
+  const [modelFilter, setModelFilter] = createSignal('')
+
+  // Filter images based on device type and model
+  const [filteredImages, setFilteredImages] = createSignal<any[]>([])
 
   createEffect(() => {
     actions.fetchImages()
     checkBrowserSupport()
+
+    // Restore device info from local storage if exists
+    const savedDeviceInfo = localStorage.getItem('deviceInfo')
+    if (savedDeviceInfo) {
+      const parsedDeviceInfo = JSON.parse(savedDeviceInfo)
+      setState('deviceInfo', parsedDeviceInfo)
+    }
+  })
+
+  // Effect to filter images based on connected device and model filter
+  createEffect(() => {
+    if (state.images.length > 0) {
+      const filterImages = () => {
+        const lowercaseFilter = modelFilter().toLowerCase().trim()
+
+        return state.images.filter(
+          image =>
+            // Filter by model filter input
+            (lowercaseFilter === '' ||
+              image.name.toLowerCase().includes(lowercaseFilter) ||
+              image.model.toLowerCase().includes(lowercaseFilter) ||
+              image.manufacturer.toLowerCase().includes(lowercaseFilter)) &&
+            // Existing device-specific filtering
+            (!state.deviceInfo?.model ||
+              image.model
+                .toLowerCase()
+                .includes(state.deviceInfo!.model.toLowerCase()) ||
+              image.manufacturer
+                .toLowerCase()
+                .includes(state.deviceInfo!.model.toLowerCase())),
+        )
+      }
+
+      setFilteredImages(filterImages())
+    }
   })
 
   const checkBrowserSupport = () => {
@@ -59,6 +95,9 @@ export const RecoveryUtility: Component = () => {
 
   const connectDevice = async (type: 'usb' | 'mass-storage') => {
     try {
+      // Save device type to local storage
+      localStorage.setItem('deviceType', type)
+
       if (type === 'usb') {
         if (!BrowserCompatibility.isWebUSBSupported()) {
           throw new Error(`WebUSB not supported in ${browserType()}`)
@@ -67,17 +106,38 @@ export const RecoveryUtility: Component = () => {
         const device = await navigator.usb.requestDevice({
           filters: [],
         })
+
+        // Prepare device info
+        const deviceInfo: DeviceInfo = {
+          isChromebook: false, // This would ideally be detected
+          model: device.productName || 'Unknown USB Device',
+          vendorId: device.vendorId,
+          productId: device.productId,
+          capabilities: {
+            canWrite: true,
+            minSpeed: 10,
+            maxSpeed: 480, // Assuming USB 2.0 speeds
+          },
+        }
+
+        // Save device info to local storage and state
+        localStorage.setItem('deviceInfo', JSON.stringify(deviceInfo))
+        setState('deviceInfo', deviceInfo)
+
         const usbWriter = new USBWriter(device)
         await usbWriter.initialize()
         setWriter(usbWriter)
         setDeviceType('usb')
       } else {
-        // Only proceed if mass storage consent is given
+        // Mass storage connection
         if (!isMassStorageConsented()) {
+          localStorage.setItem('massStorageConsent', 'false')
           throw new Error(
             'Please check the consent checkbox for mass storage device usage',
           )
         }
+
+        localStorage.setItem('massStorageConsent', 'true')
 
         if (!BrowserCompatibility.isFileSystemAccessSupported()) {
           throw new Error(
@@ -87,9 +147,23 @@ export const RecoveryUtility: Component = () => {
 
         const directoryHandle = await USBWriter.requestMassStorageDevice()
         if (directoryHandle) {
-          setFileSystemHandle(directoryHandle)
+          // Prepare device info for mass storage
           const info = await USBWriter.getMassStorageDeviceInfo(directoryHandle)
-          setDeviceInfo(info)
+          const deviceInfo: DeviceInfo = {
+            isChromebook: false,
+            model: info.name || 'Mass Storage Device',
+            capabilities: {
+              canWrite: true,
+              minSpeed: 10,
+              maxSpeed: 480,
+            },
+          }
+
+          // Save device info to local storage and state
+          localStorage.setItem('deviceInfo', JSON.stringify(deviceInfo))
+          setState('deviceInfo', deviceInfo)
+
+          setFileSystemHandle(directoryHandle)
           setDeviceType('mass-storage')
         }
       }
@@ -97,6 +171,19 @@ export const RecoveryUtility: Component = () => {
       console.error('Device connection error:', error)
       setState('error', (error as Error).message)
     }
+  }
+
+  const resetDevice = () => {
+    // Clear device-related local storage and state
+    localStorage.removeItem('deviceInfo')
+    localStorage.removeItem('deviceType')
+    localStorage.removeItem('massStorageConsent')
+
+    setWriter(null)
+    setFileSystemHandle(null)
+    setDeviceType(null)
+    setState('deviceInfo', null)
+    setState('selectedImage', null)
   }
 
   const startFlash = async () => {
@@ -196,7 +283,18 @@ export const RecoveryUtility: Component = () => {
         </Show>
 
         <section class="device-selection">
-          <Show when={!writer() && !fileSystemHandle()}>
+          <Show
+            when={!writer() && !fileSystemHandle()}
+            fallback={
+              <div class="connected-device-info">
+                <h2>Connected Device</h2>
+                <Show when={state.deviceInfo}>
+                  <p>Model: {state.deviceInfo!.model}</p>
+                  <button onClick={resetDevice}>Disconnect Device</button>
+                </Show>
+              </div>
+            }
+          >
             <div class="connection-options">
               <button onClick={() => connectDevice('usb')}>
                 Connect USB Device
@@ -207,9 +305,14 @@ export const RecoveryUtility: Component = () => {
                   <input
                     type="checkbox"
                     checked={isMassStorageConsented()}
-                    onChange={e =>
-                      setIsMassStorageConsented(e.currentTarget.checked)
-                    }
+                    onChange={e => {
+                      const checked = e.currentTarget.checked
+                      setIsMassStorageConsented(checked)
+                      localStorage.setItem(
+                        'massStorageConsent',
+                        checked.toString(),
+                      )
+                    }}
                   />
                   I have a mass storage USB device (e.g., SanDisk, external
                   drive)
@@ -224,35 +327,61 @@ export const RecoveryUtility: Component = () => {
             </div>
           </Show>
 
-          <Show when={writer()}>
+          <Show when={writer() || fileSystemHandle()}>
             <div class="image-selection">
-              <select
-                onChange={e =>
-                  actions.selectImage(
-                    state.images[e.currentTarget.selectedIndex - 1],
-                  )
+              <input
+                type="text"
+                class="model-filter-input"
+                placeholder="Filter by Chromebook model, name, or manufacturer"
+                value={modelFilter()}
+                onInput={e => setModelFilter(e.currentTarget.value)}
+              />
+
+              <Show
+                when={filteredImages().length > 0}
+                fallback={
+                  <div class="no-images-warning">
+                    No compatible recovery images found for your device or
+                    search.
+                  </div>
                 }
-                disabled={state.flashProgress.status !== 'idle'}
               >
-                <option value="">Select Recovery Image</option>
-                <For each={state.images}>
-                  {image => <option value={image.url}>{image.name}</option>}
-                </For>
-              </select>
-              <Show when={state.selectedImage}>
-                <div class="image-details">
-                  <p>
-                    Size:{' '}
-                    {(
-                      state.selectedImage!.filesize /
-                      (1024 * 1024 * 1024)
-                    ).toFixed(2)}{' '}
-                    GB
-                  </p>
-                  <p>Chrome Version: {state.selectedImage!.chrome_version}</p>
-                </div>
+                <select
+                  onChange={e => {
+                    const selectedIndex = e.currentTarget.selectedIndex - 1
+                    if (selectedIndex >= 0) {
+                      actions.selectImage(filteredImages()[selectedIndex])
+                    }
+                  }}
+                  disabled={state.flashProgress.status !== 'idle'}
+                >
+                  <option value="">Select Recovery Image</option>
+                  <For each={filteredImages()}>
+                    {image => (
+                      <option value={image.url}>
+                        {image.name} (Chrome {image.chrome_version})
+                      </option>
+                    )}
+                  </For>
+                </select>
+
+                <Show when={state.selectedImage}>
+                  <div class="image-details">
+                    <p>
+                      Size:{' '}
+                      {(
+                        state.selectedImage!.filesize /
+                        (1024 * 1024 * 1024)
+                      ).toFixed(2)}{' '}
+                      GB
+                    </p>
+                    <p>Chrome Version: {state.selectedImage!.chrome_version}</p>
+                    <p>Manufacturer: {state.selectedImage!.manufacturer}</p>
+                  </div>
+                </Show>
               </Show>
             </div>
+
             <Show
               when={
                 state.selectedImage && state.flashProgress.status === 'idle'
